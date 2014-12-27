@@ -1,28 +1,43 @@
 var fs = require('fs');
+var Promise = require('bluebird');
 var express = require('express');
 var exec = require('child_process').exec;
 var combynExpress = require('combynexpress');
-var settings = require('./lib/settings');
+var camera = require('./lib/camera');
 
 var api = express();
-
 var current = 0;
 var total = 0;
 
-var actions = [];
+function recover() {
+  var device = '/dev/bus/' + api.camera.port.replace(/[,:]/g, '/');
 
-settings.list(function(res) {
-  var string = res.toString();
+  return new Promise(function(resolve, reject) {
+    exec('fuser ' + device, function(err, output) {
+      var pid = String(output).split(' ')[1];
 
-  actions = string.split('\n').filter(function(item) {
-    return item.indexOf('/main/settings') === 0;
-  }).map(function(item) {
-    return item.split('/main/settings/')[1]; 
+      if (err || pid === String(process.pid) || !pid) {
+        return resolve();
+      }
+
+      console.log('Issue claiming device: %s', device);
+
+      exec('kill -9 ' + pid, resolve);
+    });
   });
+}
 
-  // Start API after done fetching settings.
-  api.listen(80, "0.0.0.0", function() {
-    console.log('Web server');
+
+// Start API after done fetching settings.
+camera.ready().then(function(cameras) {
+  // Use the first one by default.
+  api.camera = cameras[0];
+  api.camera.config = api.camera.getConfigAsync();
+
+  recover().then(function() {
+    api.listen(80, '0.0.0.0', function() {
+      console.log('Started web server');
+    });
   });
 });
 
@@ -34,9 +49,12 @@ api.get('/jquery.js', function(req, res) {
 });
 
 api.get('/', function(req, res) {
-  res.render('home', {
-    actions: actions,
-    timelapse: total ? current / total : 0
+  api.camera.config.then(function(config) {
+    res.render('home', {
+      timelapse: total ? current / total : 0,
+      config: config,
+      settings: config.main.children.settings
+    });
   });
 });
 
@@ -47,13 +65,25 @@ api.get('/take/preview', function(req, res) {
 });
 
 api.get('/settings', function(req, res) {
-  settings.list(function(res) {
-    res.json(res);
-  });
+  api.camera.getConfigAsync().then(res.json);
 });
 
-api.get('/settings/:name', function(req, res) {
+api.post('/settings/:name/:value', function(req, res) {
+  var name = req.params.name;
+  var value = req.params.value;
 
+  api.camera.config.then(function(config) {
+    api.camera.setConfigValue(name, value, function(err) {
+      if (err) {
+        console.log(err);
+        res.end('<script>window.alert("Unable to save settings")</script>');
+      }
+
+      config.main.children.settings[name] = value;
+
+      res.end('<script>window.alert("Saved settings")</script>');
+    });
+  });
 });
 
 api.get('/preview.jpg', function(req, res) {
@@ -71,10 +101,14 @@ api.get('/take/amount/:amount', function(req, res) {
 });
 
 function takePhoto(cb) {
-  exec('gphoto2 --capture-image', function(err) {
+  return api.camera.takePictureAsync({ download: false }).then(function() {
     setTimeout(function() {
       return cb();
     }, 5 * 1000);
+  }).catch(function() {
+    return recover().then(function() {
+      return takePhoto(cb);
+    });
   });
 }
 
@@ -93,9 +127,18 @@ function takeSeries(cb) {
 }
 
 function takePreview(cb) {
-  exec('gphoto2 --capture-preview --force-overwrite', function(err) {
+  api.camera.takePicture({
+   preview: true,
+   targetPath: '/tmp/foo.XXXXXX'
+  }, function(err, path) {
+    if (err) {
+      return recover().then(function() {
+        return takePreview(cb);
+      });
+    }
+
     // Convert RAW to JPEG
-    exec('convert capture_preview.jpg preview.jpg', function(err) {
+    exec('convert ' + path + ' preview.jpg ; rm ' + path, function(err) {
       return cb();
     });
   });
