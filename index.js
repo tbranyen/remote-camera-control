@@ -116,7 +116,12 @@ function takeSeries(cb) {
   if (current !== total) {
     takePhoto(function() {
       current++;
-      takeSeries(cb);
+
+      takePreview(function() {
+        setTimeout(function() {
+          takeSeries(cb);
+        }, 2 * 60 * 1000);
+      });
     });
   }
   else {
